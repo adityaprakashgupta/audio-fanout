@@ -3,9 +3,9 @@
 //!
 //! Usage:
 //!   audio-fanout --list
-//!   audio-fanout --source "CABLE Input" --out "Speakers" --out "Headphones:0" --out "HDMI" --out "Bluetooth:180"
+//!   audio-fanout --source "CABLE Output" --out "Speakers:180" --out "Headphones:0:50"
 //!
-//! Names are case-insensitive substrings. ":N" after an output = extra delay in ms.
+//! Names are case-insensitive substrings. --out "Name[:delay_ms[:volume_percent]]"
 
 mod capture;
 mod devices;
