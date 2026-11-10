@@ -13,6 +13,7 @@
 //! Names are case-insensitive substrings. --out "Name[:delay_ms[:volume_percent]]"
 
 mod slave;
+mod volume;
 
 use anyhow::{anyhow, bail, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -20,7 +21,7 @@ use cpal::{Device, SampleFormat, StreamConfig, SupportedStreamConfigRange};
 use ringbuf::traits::{Observer, Producer, Split};
 use ringbuf::HeapRb;
 use slave::{Slave, Stats};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,6 +62,7 @@ fn main() -> Result<()> {
     let host = cpal::default_host();
 
     let mut source: Option<String> = None;
+    let mut follow_volume = true;
     let mut outs: Vec<(String, u32, f32)> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -77,6 +79,7 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             "--source" => source = args.next(),
+            "--no-follow-volume" => follow_volume = false,
             "--out" => {
                 let v = args.next().ok_or_else(|| anyhow!("--out needs a value"))?;
                 let mut it = v.split(':');
@@ -106,6 +109,14 @@ fn main() -> Result<()> {
     let (src_ch, src_rate) = (src_cfg.channels as usize, src_cfg.sample_rate.0);
     println!("source : {}{}", name_of(&src_dev), if loopback { " (loopback)" } else { "" });
     println!("format : {src_rate} Hz, {src_ch} ch, f32");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let master = if follow_volume {
+        println!("volume : following the system default-output volume (--no-follow-volume to disable)");
+        volume::start(stop.clone())
+    } else {
+        Arc::new(AtomicU32::new(1.0f32.to_bits()))
+    };
 
     // ---- outputs ----------------------------------------------------------
     let all_out: Vec<Device> = host.output_devices()?.collect();
@@ -145,6 +156,7 @@ fn main() -> Result<()> {
             cfg.sample_rate.0,
             *delay_ms,
             volume.clamp(0.0, 1.0),
+            master.clone(),
             stats,
         )?;
         let err_label = label.clone();
@@ -177,7 +189,6 @@ fn main() -> Result<()> {
     in_stream.play()?;
 
     println!("\nRunning. Send your apps' audio to the source device. Press Enter to quit.");
-    let stop = Arc::new(AtomicBool::new(false));
     {
         let stop = stop.clone();
         std::thread::spawn(move || {

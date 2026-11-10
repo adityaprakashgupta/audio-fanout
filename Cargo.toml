@@ -11,3 +11,11 @@ rubato = "0.15"
 
 [profile.release]
 opt-level = 3
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_Media_Audio",
+  "Win32_Media_Audio_Endpoints",
+  "Win32_System_Com",
+] }

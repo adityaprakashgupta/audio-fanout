@@ -39,6 +39,8 @@ pub struct Slave {
     primed: bool,
     err_avg: f64,
     gain: f32,
+    master: Arc<AtomicU32>, // OS volume as f32 bits (see volume.rs)
+    cur_gain: f32,          // ramped toward master * gain to avoid clicks
     stats: Arc<Stats>,
 }
 
@@ -51,6 +53,7 @@ impl Slave {
         out_rate: u32,
         delay_ms: u32,
         gain: f32,
+        master: Arc<AtomicU32>,
         stats: Arc<Stats>,
     ) -> Result<Self> {
         let params = SincInterpolationParameters {
@@ -80,6 +83,8 @@ impl Slave {
             primed: false,
             err_avg: 0.0,
             gain,
+            cur_gain: f32::from_bits(master.load(Ordering::Relaxed)) * gain,
+            master,
             stats,
         })
     }
@@ -113,9 +118,7 @@ impl Slave {
             let rel = self.relative_ratio();
             let _ = self.resampler.set_resample_ratio_relative(rel, true);
             self.stats.fill_frames.store(fill as u32, Ordering::Relaxed);
-            self.stats
-                .ratio_ppm
-                .store(((rel - 1.0) * 1e6) as i32, Ordering::Relaxed);
+            self.stats.ratio_ppm.store(((rel - 1.0) * 1e6) as i32, Ordering::Relaxed);
 
             self.cons.pop_slice(&mut self.inter);
             for f in 0..CHUNK {
@@ -123,10 +126,7 @@ impl Slave {
                     self.inbuf[c][f] = self.inter[f * sc + c];
                 }
             }
-            let n = match self
-                .resampler
-                .process_into_buffer(&self.inbuf, &mut self.outbuf, None)
-            {
+            let n = match self.resampler.process_into_buffer(&self.inbuf, &mut self.outbuf, None) {
                 Ok((_, n)) => n,
                 Err(_) => break,
             };
@@ -145,17 +145,25 @@ impl Slave {
                 } else {
                     // e.g. stereo -> 5.1: fill the channels we have, silence the rest
                     for c in 0..oc {
-                        self.pending
-                            .push_back(if c < sc { self.outbuf[c][f] } else { 0.0 });
+                        self.pending.push_back(if c < sc { self.outbuf[c][f] } else { 0.0 });
                     }
                 }
             }
         }
 
         let have = self.pending.len().min(want);
-        for (o, s) in out[..have].iter_mut().zip(self.pending.drain(..have)) {
-            *o = s * self.gain;
+        // Per-output gain x OS volume, ramped linearly across this buffer (no zipper clicks).
+        let target_gain = f32::from_bits(self.master.load(Ordering::Relaxed)) * self.gain;
+        let frames = (have / oc).max(1);
+        let step = (target_gain - self.cur_gain) / frames as f32;
+        let mut src = self.pending.drain(..have);
+        for frame in out[..have].chunks_exact_mut(oc) {
+            self.cur_gain += step;
+            for o in frame.iter_mut() {
+                *o = src.next().unwrap_or(0.0) * self.cur_gain;
+            }
         }
+        drop(src);
         out[have..].fill(0.0);
         if have < want {
             self.primed = false; // underrun: rebuild the delay before playing again
@@ -168,6 +176,10 @@ mod tests {
     use super::*;
     use ringbuf::traits::{Producer, Split};
     use ringbuf::HeapRb;
+
+    fn unity() -> Arc<AtomicU32> {
+        Arc::new(AtomicU32::new(1.0f32.to_bits()))
+    }
 
     fn sine_chunk(frames: usize, ch: usize, phase: &mut f32, step: f32) -> Vec<f32> {
         let mut v = Vec::with_capacity(frames * ch);
@@ -189,8 +201,7 @@ mod tests {
         let rb = HeapRb::<f32>::new(src_rate as usize * ch * 2);
         let (mut prod, cons) = rb.split();
         let stats = Arc::new(Stats::default());
-        let mut slave =
-            Slave::new(cons, ch, src_rate, ch, src_rate, 0, 1.0, stats.clone()).unwrap();
+        let mut slave = Slave::new(cons, ch, src_rate, ch, src_rate, 0, 1.0, unity(), stats.clone()).unwrap();
 
         let mut phase = 0.0f32;
         let mut out_acc = 0.0f64;
@@ -208,10 +219,7 @@ mod tests {
         let fill = stats.fill_frames.load(Ordering::Relaxed) as f64;
         let target = stats.target_frames.load(Ordering::Relaxed) as f64;
         assert!((rel - 0.9997).abs() < 0.0002, "ratio {rel}");
-        assert!(
-            fill > target * 0.5 && fill < target * 2.0,
-            "fill {fill} target {target}"
-        );
+        assert!(fill > target * 0.5 && fill < target * 2.0, "fill {fill} target {target}");
     }
 
     /// 48 kHz stereo source into a 44.1 kHz mono device: output must be audible
@@ -220,17 +228,8 @@ mod tests {
     fn converts_rate_and_channels() {
         let rb = HeapRb::<f32>::new(48_000 * 2 * 2);
         let (mut prod, cons) = rb.split();
-        let mut slave = Slave::new(
-            cons,
-            2,
-            48_000,
-            1,
-            44_100,
-            0,
-            1.0,
-            Arc::new(Stats::default()),
-        )
-        .unwrap();
+        let mut slave =
+            Slave::new(cons, 2, 48_000, 1, 44_100, 0, 1.0, unity(), Arc::new(Stats::default())).unwrap();
         let mut phase = 0.0f32;
         let (mut total, mut peak) = (0usize, 0.0f32);
         let mut acc = 0.0f64;
@@ -252,17 +251,8 @@ mod tests {
     fn delay_holds_back_start() {
         let rb = HeapRb::<f32>::new(48_000 * 2 * 2);
         let (mut prod, cons) = rb.split();
-        let mut slave = Slave::new(
-            cons,
-            2,
-            48_000,
-            2,
-            48_000,
-            100,
-            1.0,
-            Arc::new(Stats::default()),
-        )
-        .unwrap();
+        let mut slave =
+            Slave::new(cons, 2, 48_000, 2, 48_000, 100, 1.0, unity(), Arc::new(Stats::default())).unwrap();
         let mut phase = 0.0f32;
         let mut first_audio_tick = None;
         for t in 0..40 {
@@ -276,5 +266,34 @@ mod tests {
         // 100 ms delay + 20 ms cushion at 10 ms per tick => audio starts around tick 12.
         let t = first_audio_tick.expect("never started");
         assert!((11..=15).contains(&t), "started at tick {t}");
+    }
+    /// OS volume changes must scale the output smoothly, and mute must reach silence.
+    #[test]
+    fn follows_master_volume_and_mute() {
+        let rb = HeapRb::<f32>::new(48_000 * 2 * 2);
+        let (mut prod, cons) = rb.split();
+        let master = unity();
+        let mut slave =
+            Slave::new(cons, 2, 48_000, 2, 48_000, 0, 1.0, master.clone(), Arc::new(Stats::default()))
+                .unwrap();
+        let mut phase = 0.0f32;
+        let mut run = |ticks: usize, slave: &mut Slave| -> f32 {
+            let mut peak = 0.0f32;
+            for _ in 0..ticks {
+                prod.push_slice(&sine_chunk(480, 2, &mut phase, 0.1));
+                let mut out = vec![0.0f32; 480 * 2];
+                slave.fill(&mut out);
+                peak = out.iter().fold(0.0, |m, s| m.max(s.abs()));
+            }
+            peak
+        };
+        let full = run(60, &mut slave);
+        assert!(full > 0.45, "full {full}");
+        master.store(0.25f32.to_bits(), Ordering::Relaxed);
+        let quarter = run(60, &mut slave);
+        assert!((quarter - full * 0.25).abs() < 0.03, "quarter {quarter} vs {full}");
+        master.store(0.0f32.to_bits(), Ordering::Relaxed);
+        let muted = run(60, &mut slave);
+        assert!(muted < 0.001, "muted {muted}");
     }
 }
