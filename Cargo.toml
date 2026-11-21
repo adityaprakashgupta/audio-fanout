@@ -5,7 +5,9 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
+arc-swap = "1"
 cpal = "0.15"
+ratatui = "0.29"
 ringbuf = "0.4"
 rubato = "0.15"
 

@@ -8,10 +8,39 @@ pub fn name_of(d: &Device) -> String {
     d.name().unwrap_or_else(|_| "<unknown>".into())
 }
 
-/// First device whose name contains `needle` (case-insensitive).
+/// Does device `name` match `needle`? (exact, or case-insensitive substring)
+pub fn name_matches(needle: &str, name: &str) -> bool {
+    name == needle || name.to_lowercase().contains(&needle.to_lowercase())
+}
+
+/// The device whose name equals `needle`, else the first whose name contains it.
+/// Exact-first matters because the UI adds devices by their full name.
 pub fn find(devs: impl Iterator<Item = Device>, needle: &str) -> Option<Device> {
+    let mut v: Vec<Device> = devs.collect();
     let n = needle.to_lowercase();
-    devs.into_iter().find(|d| name_of(d).to_lowercase().contains(&n))
+    let idx = v
+        .iter()
+        .position(|d| name_of(d) == needle)
+        .or_else(|| v.iter().position(|d| name_of(d).to_lowercase().contains(&n)))?;
+    Some(v.swap_remove(idx))
+}
+
+/// Full name of the output device matching `needle`, if it is present right now.
+pub fn resolve_output_name(host: &Host, needle: &str) -> Option<String> {
+    find(host.output_devices().ok()?, needle).map(|d| name_of(&d))
+}
+
+fn norm(s: &str) -> String {
+    let base = s.split('(').next().unwrap_or(s).to_lowercase();
+    base.split_whitespace().filter(|w| *w != "input" && *w != "output").collect::<Vec<_>>().join(" ")
+}
+
+/// Would playing on `out` feed back into `source`? True for the two halves of a
+/// virtual cable ("CABLE Output" / "CABLE Input"), a device that is both, and a
+/// loopback source's own output.
+pub fn loops_back_to(source: &str, out: &str) -> bool {
+    let a = norm(source);
+    !a.is_empty() && a == norm(out)
 }
 
 /// Pick an f32 config at the device's default rate/channels.
@@ -51,4 +80,26 @@ pub fn resolve_source(host: &Host, needle: &str) -> Result<(Device, bool)> {
         bail!("no input or output device matching \"{needle}\" (try --list)");
     }
     bail!("no input device matching \"{needle}\" (try --list)")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_feedback_pairs() {
+        assert!(loops_back_to("CABLE Output (VB-Audio Virtual Cable)", "CABLE Input (VB-Audio Virtual Cable)"));
+        assert!(loops_back_to("BlackHole 2ch", "BlackHole 2ch"));
+        assert!(loops_back_to("Speakers (Realtek(R) Audio)", "Speakers (Realtek(R) Audio)"));
+        assert!(!loops_back_to("CABLE Output (VB-Audio Virtual Cable)", "Speakers (Realtek(R) Audio)"));
+        assert!(!loops_back_to("CABLE Output (VB-Audio Virtual Cable)", "Headphones (OnePlus Bullets Wireless Z2)"));
+        assert!(!loops_back_to("", ""));
+    }
+
+    #[test]
+    fn matching_rules() {
+        assert!(name_matches("realtek", "Speakers (Realtek(R) Audio)"));
+        assert!(name_matches("Speakers (Realtek(R) Audio)", "Speakers (Realtek(R) Audio)"));
+        assert!(!name_matches("onePlus", "Speakers (Realtek(R) Audio)"));
+    }
 }

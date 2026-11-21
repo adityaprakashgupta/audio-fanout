@@ -1,46 +1,58 @@
-//! audio-fanout (cross-platform): capture one source and play it on any number of
-//! output devices, keeping them locked together and reconnecting any that drop.
+//! audio-fanout: capture one source and play it on any number of output devices,
+//! keeping them locked together and reconnecting any that drop.
 //!
-//! The source is an INPUT device on every OS:
-//!   Windows : "CABLE Output" (VB-Cable) -- or, as a convenience, any output device
-//!             by name, which is captured via WASAPI loopback
-//!   macOS   : "BlackHole 2ch" (or any virtual device that shows up as an input)
-//!   Linux   : a null sink's monitor source
+//! Default: an interactive terminal UI. `--no-tui` runs headless (same engine).
 //!
-//!   audio-fanout --list
+//!   audio-fanout                                   # TUI, pick the source on screen
+//!   audio-fanout --source "CABLE Output"           # TUI, add outputs with 'a'
 //!   audio-fanout --source "CABLE Output" --out "Speakers:180" --out "Headphones:0:50"
+//!   audio-fanout --no-tui --source ... --out ...   # headless, logs to stdout
+//!   audio-fanout --list
 //!
 //! Names are case-insensitive substrings. --out "Name[:delay_ms[:volume_percent]]"
-//! Outputs that are missing at startup, or that disconnect later, are retried
-//! automatically; the source must exist at startup (its format sizes the buffers).
 
 mod connectors;
 mod devices;
+mod engine;
+mod log;
 mod slave;
 mod supervisor;
+mod tui;
 mod volume;
+mod watch;
 
 use anyhow::{anyhow, bail, Result};
-use connectors::{OutputConnector, SourceConnector};
 use cpal::traits::HostTrait;
-use devices::{f32_config, name_of, resolve_source};
-use ringbuf::traits::Split;
-use ringbuf::HeapRb;
-use slave::{Slave, Stats};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use supervisor::Timing;
+use devices::name_of;
+use engine::Engine;
+use watch::Watcher;
 
-fn main() -> Result<()> {
+struct Options {
+    source: Option<String>,
+    outs: Vec<(String, u32, u32)>, // name, delay ms, volume %
+    follow_volume: bool,
+    tui: bool,
+}
+
+const HELP: &str = "\
+audio-fanout: play one audio source on many output devices, in sync.
+
+USAGE:
+  audio-fanout [--source NAME] [--out NAME[:DELAY_MS[:VOLUME_PCT]]]... [--no-tui] [--no-follow-volume]
+  audio-fanout --list
+
+Without --source the TUI asks you to pick one. The TUI shows its keys on screen.";
+
+fn parse_args() -> Result<Option<Options>> {
     let host = cpal::default_host();
-
-    let mut source: Option<String> = None;
-    let mut follow_volume = true;
-    let mut outs: Vec<(String, u32, f32)> = Vec::new();
+    let mut o = Options { source: None, outs: Vec::new(), follow_volume: true, tui: true };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--help" | "-h" => {
+                println!("{HELP}");
+                return Ok(None);
+            }
             "--list" => {
                 println!("INPUT devices (use as --source):");
                 for d in host.input_devices()? {
@@ -50,121 +62,74 @@ fn main() -> Result<()> {
                 for d in host.output_devices()? {
                     println!("  {}", name_of(&d));
                 }
-                return Ok(());
+                return Ok(None);
             }
-            "--source" => source = args.next(),
-            "--no-follow-volume" => follow_volume = false,
+            "--source" => o.source = args.next(),
+            "--no-follow-volume" => o.follow_volume = false,
+            "--no-tui" => o.tui = false,
             "--out" => {
                 let v = args.next().ok_or_else(|| anyhow!("--out needs a value"))?;
                 let mut it = v.split(':');
                 let name = it.next().unwrap().to_string();
                 let delay = it.next().and_then(|d| d.parse().ok()).unwrap_or(0u32);
-                let vol = it.next().and_then(|d| d.parse::<f32>().ok()).unwrap_or(100.0) / 100.0;
-                outs.push((name, delay, vol));
+                let vol = it.next().and_then(|d| d.parse::<f32>().ok()).unwrap_or(100.0);
+                o.outs.push((name, delay, vol.round().clamp(0.0, 100.0) as u32));
             }
-            other => bail!("unknown argument {other}"),
+            other => bail!("unknown argument {other} (try --help)"),
         }
     }
-    let source = source.ok_or_else(|| anyhow!("--source is required (see --list)"))?;
-    if outs.is_empty() {
-        bail!("give at least one --out");
+    Ok(Some(o))
+}
+
+fn run_headless(o: Options) -> Result<()> {
+    log::set_echo(true);
+    let source = o.source.ok_or_else(|| anyhow!("--source is required with --no-tui (see --list)"))?;
+    if o.outs.is_empty() {
+        bail!("give at least one --out with --no-tui");
     }
-
-    // The source must exist now: its format sizes every ring buffer and resampler.
-    let (src_dev, loopback) = resolve_source(&host, &source)?;
-    let src_cfg = f32_config(&src_dev, loopback)?;
-    let (src_ch, src_rate) = (src_cfg.channels as usize, src_cfg.sample_rate.0);
-    let src_name = name_of(&src_dev);
-    drop(src_dev);
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let master = if follow_volume {
-        println!("volume : following the system default-output volume (--no-follow-volume to disable)");
-        volume::start(stop.clone())
-    } else {
-        Arc::new(AtomicU32::new(1.0f32.to_bits()))
-    };
-
-    let mut handles = Vec::new();
-    let mut producers = Vec::new();
-    let mut all_stats: Vec<(String, Arc<Stats>)> = Vec::new();
-
-    for (needle, delay_ms, volume) in &outs {
-        let rb = HeapRb::<f32>::new(src_rate as usize * src_ch * 2); // 2 s headroom
-        let (prod, cons) = rb.split();
-        producers.push(prod);
-
-        let stats = Arc::new(Stats::default());
-        all_stats.push((needle.clone(), stats.clone()));
-        let slave = Arc::new(Mutex::new(Slave::new(
-            cons,
-            src_ch,
-            src_rate,
-            *delay_ms,
-            volume.clamp(0.0, 1.0),
-            master.clone(),
-            stats.clone(),
-        )?));
-        let forbid = loopback.then(|| src_name.clone());
-        let n = needle.clone();
-        println!("output : {needle} (+{delay_ms} ms, {}%)", (volume * 100.0) as u32);
-        handles.push(supervisor::spawn(
-            needle.clone(),
-            move || OutputConnector { needle: n, slave, forbid },
-            stop.clone(),
-            stats,
-            Timing::default(),
-        ));
+    let mut engine = Engine::start(&source, o.follow_volume)?;
+    log::log(format!("source: {} ({} Hz, {} ch)", engine.source_name, engine.src_rate, engine.src_ch));
+    for (name, delay, vol) in &o.outs {
+        engine.add_output(name, *delay, *vol)?;
     }
-
-    // The source supervisor owns capture; outputs keep their buffers while it is down,
-    // play silence if they run dry, and re-prime together when audio returns.
-    let producers = Arc::new(Mutex::new(producers));
-    handles.push(supervisor::spawn(
-        "source".into(),
-        {
-            let needle = source.clone();
-            move || SourceConnector {
-                needle,
-                rate: src_rate,
-                channels: src_cfg.channels,
-                producers,
-            }
-        },
-        stop.clone(),
-        Arc::new(Stats::default()),
-        Timing::default(),
-    ));
-
     println!("\nRunning. Send your apps' audio to the source device. Press Enter to quit.");
-    {
-        let stop = stop.clone();
-        std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = std::io::stdin().read_line(&mut s);
-            stop.store(true, Ordering::Relaxed);
-        });
-    }
-    let debug = std::env::var_os("FANOUT_DEBUG").is_some();
-    let mut tick = 0u32;
-    while !stop.load(Ordering::Relaxed) {
-        std::thread::sleep(Duration::from_millis(500));
-        tick += 1;
-        if debug && tick % 10 == 0 {
-            for (label, s) in &all_stats {
-                eprintln!(
-                    "[{label}] {} fill={}/{} frames, ratio={:+} ppm, reconnects={}",
-                    if s.connected.load(Ordering::Relaxed) { "up  " } else { "DOWN" },
-                    s.fill_frames.load(Ordering::Relaxed),
-                    s.target_frames.load(Ordering::Relaxed),
-                    s.ratio_ppm.load(Ordering::Relaxed),
-                    s.reconnects.load(Ordering::Relaxed)
-                );
-            }
-        }
-    }
-    for h in handles {
-        let _ = h.join();
-    }
+    let mut s = String::new();
+    std::io::stdin().read_line(&mut s)?;
+    engine.shutdown();
     Ok(())
+}
+
+fn run_tui(o: Options) -> Result<()> {
+    log::set_echo(false); // anything printed would tear the screen
+    let mut terminal = ratatui::try_init().map_err(|e| {
+        anyhow!("cannot start the terminal UI ({e}); run it in a real terminal, or use --no-tui")
+    })?;
+    let watcher = Watcher::start();
+    let result = (|| -> Result<()> {
+        let source = match o.source {
+            Some(s) => s,
+            None => match tui::pick_source(&mut terminal, &watcher)? {
+                Some(s) => s,
+                None => return Ok(()),
+            },
+        };
+        let mut engine = Engine::start(&source, o.follow_volume)?;
+        for (name, delay, vol) in &o.outs {
+            engine.add_output(name, *delay, *vol)?;
+        }
+        tui::run(&mut terminal, &mut engine, &watcher)?;
+        engine.shutdown();
+        Ok(())
+    })();
+    ratatui::restore();
+    result
+}
+
+fn main() -> Result<()> {
+    let Some(o) = parse_args()? else { return Ok(()) };
+    if o.tui {
+        run_tui(o)
+    } else {
+        run_headless(o)
+    }
 }
