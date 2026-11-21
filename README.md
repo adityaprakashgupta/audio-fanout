@@ -30,6 +30,9 @@ as you like, on any OS, with per-device delay and volume.
   slowly falls out of sync. Each output watches its buffer fill level and nudges
   a high-quality resampler ([rubato](https://crates.io/crates/rubato)) by a few
   parts per million, with no clicks.
+- **Automatic reconnection.** An output that is switched off, unplugged or out of
+  range is retried in the background and resynced when it returns. The other
+  outputs never notice. Outputs that are missing at startup are simply waited for.
 - **Per-output delay** to align Bluetooth (often 150 ms or more) with wired
   devices.
 - **Per-output volume**, plus **system volume following** (volume keys and mute
@@ -55,6 +58,38 @@ slow ends up with a ratio around 0.9999, which is inaudible but keeps it aligned
 indefinitely. After silence or an underrun, the output re-primes so the delay is
 rebuilt before audio resumes.
 
+## Connection handling
+
+Every output, and the source, runs under its own small supervisor thread that
+connects, watches the stream and reconnects it.
+
+```
+find device ─▶ configure ─▶ start stream ─▶ watch ──(error / device gone)──┐
+     ▲                                                                      │
+     └──────────── retry with backoff (0.5 s, 1 s, 2 s ... max 5 s) ◀───────┘
+```
+
+- **Detection.** A stream error from the OS marks the connection dead. As a
+  backstop, every 2 seconds the supervisor also checks that the device still
+  appears in the OS device list.
+- **Resync, not restart.** Each output owns its buffer, and the source is the
+  shared timeline. When a device returns, only that output is rebuilt: its stream
+  is reopened, stale audio is flushed, the drift controller is reset and the
+  output waits until its delay is buffered again from *live* audio. Delays
+  therefore line up with the other outputs without touching them.
+- **New format on return.** The device may come back with a different sample rate
+  or channel count (Bluetooth often does this when the codec changes). The
+  resampler and channel mapping are rebuilt for the new format automatically.
+- **Source loss.** If the source drops, the outputs play silence and re-prime
+  together when it returns. The source must exist at startup, and it must come
+  back in the same format, otherwise you get a clear message asking for a
+  restart (the buffers are sized for the original format).
+- **Quiet logs.** State changes are printed once (`connected`, `lost`,
+  `reconnected`), not on every retry.
+
+If a Bluetooth device renegotiates its codec on reconnect, its latency can change.
+The resync is correct, but you may need to re-tune that device's `:delay`.
+
 ## Setup
 
 The source is always an **input device**, because that is the one thing every OS
@@ -62,7 +97,7 @@ and cpal can capture uniformly. You make one by installing a virtual audio devic
 then setting it as your system's default **output**.
 
 | OS | Install | Source (`--source`) | Set as default output |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Windows | [VB-Cable](https://vb-audio.com/Cable/) | `CABLE Output` | `CABLE Input` |
 | macOS | [BlackHole](https://github.com/ExistentialAudio/BlackHole) | `BlackHole 2ch` | `BlackHole 2ch` |
 | Linux | a PulseAudio/PipeWire null sink (below) | its monitor source | the null sink |
@@ -107,7 +142,7 @@ audio-fanout --source "<source>" --out "<name>[:delay_ms[:volume_percent]]" [--o
 Names are case-insensitive substrings of what `--list` prints.
 
 | Option | Meaning |
-|---|---|
+| --- | --- |
 | `--list` | Print input devices (sources) and output devices |
 | `--source NAME` | The device audio is copied from |
 | `--out NAME[:DELAY[:VOL]]` | An output. `DELAY` in milliseconds, `VOL` in percent. Repeat for each output |
@@ -148,7 +183,7 @@ times a second and scales every output by it, on top of each output's own
 `:volume`.
 
 | OS | How it is read |
-|---|---|
+| --- | --- |
 | Windows | Endpoint volume API (exact dB attenuation) |
 | Linux | `pactl` (percent, cubic curve as PulseAudio uses) |
 | macOS | `osascript` (approximate curve) |
@@ -168,8 +203,10 @@ Caveats:
 
 - Requires `f32` sample format. Common backends offer it. A raw ALSA hardware
   device that only offers integers is rejected with a message.
-- No automatic reconnect: if a Bluetooth device drops, that output stops (the
-  others continue) until you restart.
+- The source must be present at startup, and must return with the same format
+  after a drop. Outputs have no such limits.
+- Disconnects are noticed by stream errors plus a 2-second device-list check, not
+  by OS hot-plug notifications, so detection can take up to a couple of seconds.
 - Downmix and upmix are simple (average to mono, duplicate to stereo, extra
   channels silent), not full surround handling.
 - Never choose the virtual device's own playback side as an output, or you create
@@ -179,9 +216,11 @@ Caveats:
 
 ## Status
 
-The drift controller, delay, rate and channel conversion, and volume ramping are
-covered by unit tests (`cargo test`) that run without any audio hardware, and the
-volume parsers are tested for Linux and macOS output formats. The code type-checks
+The drift controller, delay, rate and channel conversion, volume ramping and the
+reconnect state machine (device absent at startup, unplugged, plugged back in,
+prompt shutdown) are covered by unit tests (`cargo test`) that run without any
+audio hardware, and the volume parsers are tested for Linux and macOS output
+formats. Reconnection against real devices has not been exercised yet. The code type-checks
 for Windows (MSVC).
 
 Windows is the primary development platform. macOS and Linux paths are written
@@ -195,7 +234,8 @@ cargo test --release
 
 ## Roadmap
 
-- Reconnect outputs automatically when devices appear and disappear
+- Use OS hot-plug notifications for instant detection instead of polling
+- Let the source change format on reconnect
 - Save outputs, delays and volumes in a config file
 - Tray or small GUI for volume and delay
 - Terminal master-volume keys for platforms without a system volume to follow
@@ -204,4 +244,5 @@ cargo test --release
 
 ## License
 
-MIT
+Choose a license for the project (for example MIT or Apache-2.0) and add a
+`LICENSE` file.

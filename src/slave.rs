@@ -11,7 +11,7 @@ use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
 
 const CHUNK: usize = 256; // source frames per resampler call
@@ -23,6 +23,8 @@ pub struct Stats {
     pub fill_frames: AtomicU32,
     pub ratio_ppm: AtomicI32, // (ratio - 1) * 1e6
     pub target_frames: AtomicU32,
+    pub connected: AtomicBool, // set by the supervisor
+    pub reconnects: AtomicU32, // times an established connection was lost
 }
 
 pub struct Slave {
@@ -44,27 +46,31 @@ pub struct Slave {
     stats: Arc<Stats>,
 }
 
+fn make_resampler(out_rate: u32, src_rate: u32, src_ch: usize) -> Result<SincFixedIn<f32>> {
+    let params = SincInterpolationParameters {
+        sinc_len: 128,
+        f_cutoff: 0.95,
+        interpolation: SincInterpolationType::Linear,
+        oversampling_factor: 128,
+        window: WindowFunction::BlackmanHarris2,
+    };
+    let base = out_rate as f64 / src_rate as f64;
+    Ok(SincFixedIn::<f32>::new(base, MAX_REL, params, CHUNK, src_ch)?)
+}
+
 impl Slave {
+    /// Starts with the output format equal to the source format. Call
+    /// [`Slave::reconfigure`] once the real device (and its format) is known.
     pub fn new(
         cons: HeapCons<f32>,
         src_ch: usize,
         src_rate: u32,
-        out_ch: usize,
-        out_rate: u32,
         delay_ms: u32,
         gain: f32,
         master: Arc<AtomicU32>,
         stats: Arc<Stats>,
     ) -> Result<Self> {
-        let params = SincInterpolationParameters {
-            sinc_len: 128,
-            f_cutoff: 0.95,
-            interpolation: SincInterpolationType::Linear,
-            oversampling_factor: 128,
-            window: WindowFunction::BlackmanHarris2,
-        };
-        let base = out_rate as f64 / src_rate as f64;
-        let resampler = SincFixedIn::<f32>::new(base, MAX_REL, params, CHUNK, src_ch)?;
+        let resampler = make_resampler(src_rate, src_rate, src_ch)?;
         let outbuf = vec![vec![0.0f32; resampler.output_frames_max()]; src_ch];
         let src_rate = src_rate as usize;
         let target = delay_ms as usize * src_rate / 1000 + src_rate / 50; // delay + 20 ms
@@ -72,14 +78,14 @@ impl Slave {
         Ok(Slave {
             cons,
             src_ch,
-            out_ch,
+            out_ch: src_ch,
             src_rate,
             target,
             resampler,
             inter: vec![0.0; CHUNK * src_ch],
             inbuf: vec![vec![0.0; CHUNK]; src_ch],
             outbuf,
-            pending: VecDeque::with_capacity(out_rate as usize * out_ch / 5),
+            pending: VecDeque::with_capacity(src_rate * src_ch / 5),
             primed: false,
             err_avg: 0.0,
             gain,
@@ -87,6 +93,31 @@ impl Slave {
             master,
             stats,
         })
+    }
+
+    /// Throw away everything buffered and start over: stale audio is flushed, the
+    /// drift controller is reset and the delay is rebuilt from live audio.
+    /// Call while no audio callback is running (the supervisor guarantees this).
+    pub fn reset(&mut self) {
+        let n = self.cons.occupied_len();
+        self.cons.skip(n);
+        self.pending.clear();
+        self.primed = false;
+        self.err_avg = 0.0;
+        self.cur_gain = f32::from_bits(self.master.load(Ordering::Relaxed)) * self.gain;
+        self.resampler.reset();
+        let _ = self.resampler.set_resample_ratio_relative(1.0, false);
+    }
+
+    /// Adapt to a (re)connected device, which may run at a different rate or channel
+    /// count than last time (e.g. a Bluetooth codec change). Implies [`Slave::reset`].
+    pub fn reconfigure(&mut self, out_ch: usize, out_rate: u32) -> Result<()> {
+        self.resampler = make_resampler(out_rate, self.src_rate as u32, self.src_ch)?;
+        self.outbuf = vec![vec![0.0f32; self.resampler.output_frames_max()]; self.src_ch];
+        self.out_ch = out_ch;
+        self.pending = VecDeque::with_capacity(out_rate as usize * out_ch / 5);
+        self.reset();
+        Ok(())
     }
 
     /// Current resample ratio relative to the nominal one (for tests/diagnostics).
@@ -201,7 +232,7 @@ mod tests {
         let rb = HeapRb::<f32>::new(src_rate as usize * ch * 2);
         let (mut prod, cons) = rb.split();
         let stats = Arc::new(Stats::default());
-        let mut slave = Slave::new(cons, ch, src_rate, ch, src_rate, 0, 1.0, unity(), stats.clone()).unwrap();
+        let mut slave = Slave::new(cons, ch, src_rate, 0, 1.0, unity(), stats.clone()).unwrap();
 
         let mut phase = 0.0f32;
         let mut out_acc = 0.0f64;
@@ -229,7 +260,8 @@ mod tests {
         let rb = HeapRb::<f32>::new(48_000 * 2 * 2);
         let (mut prod, cons) = rb.split();
         let mut slave =
-            Slave::new(cons, 2, 48_000, 1, 44_100, 0, 1.0, unity(), Arc::new(Stats::default())).unwrap();
+            Slave::new(cons, 2, 48_000, 0, 1.0, unity(), Arc::new(Stats::default())).unwrap();
+        slave.reconfigure(1, 44_100).unwrap();
         let mut phase = 0.0f32;
         let (mut total, mut peak) = (0usize, 0.0f32);
         let mut acc = 0.0f64;
@@ -252,7 +284,7 @@ mod tests {
         let rb = HeapRb::<f32>::new(48_000 * 2 * 2);
         let (mut prod, cons) = rb.split();
         let mut slave =
-            Slave::new(cons, 2, 48_000, 2, 48_000, 100, 1.0, unity(), Arc::new(Stats::default())).unwrap();
+            Slave::new(cons, 2, 48_000, 100, 1.0, unity(), Arc::new(Stats::default())).unwrap();
         let mut phase = 0.0f32;
         let mut first_audio_tick = None;
         for t in 0..40 {
@@ -274,7 +306,7 @@ mod tests {
         let (mut prod, cons) = rb.split();
         let master = unity();
         let mut slave =
-            Slave::new(cons, 2, 48_000, 2, 48_000, 0, 1.0, master.clone(), Arc::new(Stats::default()))
+            Slave::new(cons, 2, 48_000, 0, 1.0, master.clone(), Arc::new(Stats::default()))
                 .unwrap();
         let mut phase = 0.0f32;
         let mut run = |ticks: usize, slave: &mut Slave| -> f32 {
@@ -295,5 +327,61 @@ mod tests {
         master.store(0.0f32.to_bits(), Ordering::Relaxed);
         let muted = run(60, &mut slave);
         assert!(muted < 0.001, "muted {muted}");
+    }
+
+    /// A reconnect must flush stale audio (so the device does not play seconds-old
+    /// sound) and rebuild the delay from live audio, like a fresh start.
+    #[test]
+    fn reset_flushes_stale_audio_and_reprimes() {
+        let rb = HeapRb::<f32>::new(48_000 * 2 * 2);
+        let (mut prod, cons) = rb.split();
+        let mut slave =
+            Slave::new(cons, 2, 48_000, 0, 1.0, unity(), Arc::new(Stats::default())).unwrap();
+        let mut phase = 0.0f32;
+        // Device was away: a full second of old audio piled up in the ring.
+        for _ in 0..100 {
+            prod.push_slice(&sine_chunk(480, 2, &mut phase, 0.1));
+        }
+        slave.reset();
+        // Nothing stale may come out, and it must stay silent until re-primed.
+        let mut out = vec![0.0f32; 480 * 2];
+        slave.fill(&mut out);
+        assert!(out.iter().all(|s| *s == 0.0), "stale audio leaked");
+        // Live audio resumes after the cushion (20 ms) is rebuilt.
+        let mut started = None;
+        for t in 0..10 {
+            prod.push_slice(&sine_chunk(480, 2, &mut phase, 0.1));
+            let mut out = vec![0.0f32; 480 * 2];
+            slave.fill(&mut out);
+            if started.is_none() && out.iter().any(|s| *s != 0.0) {
+                started = Some(t);
+            }
+        }
+        assert!(matches!(started, Some(t) if t <= 4), "restart {started:?}");
+    }
+
+    /// Reconnecting to a device with a different format must keep audio flowing.
+    #[test]
+    fn reconfigure_to_new_format_keeps_audio_flowing() {
+        let rb = HeapRb::<f32>::new(48_000 * 2 * 2);
+        let (mut prod, cons) = rb.split();
+        let mut slave =
+            Slave::new(cons, 2, 48_000, 0, 1.0, unity(), Arc::new(Stats::default())).unwrap();
+        let mut phase = 0.0f32;
+        for (ch, rate) in [(2usize, 48_000u32), (1, 44_100), (2, 96_000)] {
+            slave.reconfigure(ch, rate).unwrap();
+            let per_tick = rate as f64 / 100.0;
+            let (mut acc, mut peak) = (0.0f64, 0.0f32);
+            for _ in 0..200 {
+                prod.push_slice(&sine_chunk(480, 2, &mut phase, 0.1));
+                acc += per_tick;
+                let frames = acc as usize;
+                acc -= frames as f64;
+                let mut out = vec![0.0f32; frames * ch];
+                slave.fill(&mut out);
+                peak = out.iter().fold(peak, |m, s| m.max(s.abs()));
+            }
+            assert!(peak > 0.4, "{ch} ch @ {rate}: peak {peak}");
+        }
     }
 }
