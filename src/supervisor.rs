@@ -64,9 +64,9 @@ pub fn run<C: Connector>(label: &str, mut c: C, stop: &AtomicBool, stats: &Stats
             Ok(mut conn) => {
                 let what = c.describe(&conn);
                 if ever_connected {
-                    println!("[{label}] reconnected: {what}");
+                    crate::log::log(format!("[{label}] reconnected: {what}"));
                 } else {
-                    println!("[{label}] connected: {what}");
+                    crate::log::log(format!("[{label}] connected: {what}"));
                 }
                 ever_connected = true;
                 last_err = None;
@@ -80,13 +80,13 @@ pub fn run<C: Connector>(label: &str, mut c: C, stop: &AtomicBool, stats: &Stats
                 stats.connected.store(false, Ordering::Relaxed);
                 if !stop.load(Ordering::Relaxed) {
                     stats.reconnects.fetch_add(1, Ordering::Relaxed);
-                    println!("[{label}] lost, waiting for it to come back...");
+                    crate::log::log(format!("[{label}] lost, waiting for it to come back..."));
                 }
             }
             Err(e) => {
                 let msg = e.to_string();
                 if last_err.as_deref() != Some(msg.as_str()) {
-                    println!("[{label}] not available: {msg} (retrying)");
+                    crate::log::log(format!("[{label}] not available: {msg} (retrying)"));
                     last_err = Some(msg);
                 }
                 sleep_unless_stopped(backoff, stop);

@@ -1,13 +1,14 @@
 //! cpal-backed connectors: one for the source stream, one per output stream.
 
-use crate::devices::{f32_config, find, name_of, resolve_source};
+use crate::devices::{f32_config, find, loops_back_to, name_of, resolve_source};
+use crate::engine::SinkList;
+use crate::log::log;
 use crate::slave::Slave;
 use crate::supervisor::Connector;
 use anyhow::{anyhow, bail, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Stream;
 use ringbuf::traits::{Observer, Producer};
-use ringbuf::HeapProd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -22,8 +23,8 @@ pub struct OutputConnector {
     pub needle: String,
     /// Shared with the audio callback, which only ever `try_lock`s it (never blocks).
     pub slave: Arc<Mutex<Slave>>,
-    /// If set, refuse this device name (it is the loopback source: would feed back).
-    pub forbid: Option<String>,
+    /// Name of the source device: refuse outputs that would feed back into it.
+    pub source_name: String,
 }
 
 pub struct OutConn {
@@ -42,8 +43,8 @@ impl Connector for OutputConnector {
         let dev = find(host.output_devices()?, &self.needle)
             .ok_or_else(|| anyhow!("no output device matching \"{}\"", self.needle))?;
         let name = name_of(&dev);
-        if self.forbid.as_deref() == Some(name.as_str()) {
-            bail!("\"{name}\" is the loopback source; routing it to itself would feed back");
+        if loops_back_to(&self.source_name, &name) {
+            bail!("\"{name}\" would feed back into the source");
         }
         let cfg = f32_config(&dev, true)?;
 
@@ -64,7 +65,7 @@ impl Connector for OutputConnector {
                 Err(_) => data.fill(0.0), // supervisor is mid-reconfigure: stay silent
             },
             move |e| {
-                eprintln!("[{label}] stream error: {e}");
+                log(format!("[{label}] stream error: {e}"));
                 f2.store(true, Ordering::Relaxed);
             },
             None,
@@ -102,8 +103,9 @@ pub struct SourceConnector {
     /// for the original format) no longer match, so we refuse and ask for a restart.
     pub rate: u32,
     pub channels: u16,
-    /// Producers for every output's ring buffer, written by the input callback.
-    pub producers: Arc<Mutex<Vec<HeapProd<f32>>>>,
+    /// The live list of outputs' ring-buffer producers, swapped atomically when the
+    /// user adds or removes an output (the input callback never blocks on it).
+    pub sinks: SinkList,
 }
 
 pub struct SrcConn {
@@ -130,12 +132,14 @@ impl Connector for SourceConnector {
         }
         let name = name_of(&dev);
         let failed = Arc::new(AtomicBool::new(false));
-        let (f2, prods) = (failed.clone(), self.producers.clone());
+        let (f2, sinks) = (failed.clone(), self.sinks.clone());
         let stream = dev.build_input_stream(
             &cfg,
             move |data: &[f32], _| {
-                if let Ok(mut ps) = prods.try_lock() {
-                    for p in ps.iter_mut() {
+                let list = sinks.load();
+                for sink in list.iter() {
+                    // The lock is never contended (only this callback touches a producer).
+                    if let Ok(mut p) = sink.prod.try_lock() {
                         // All-or-nothing: never push a partial frame (channels would misalign).
                         if p.vacant_len() >= data.len() {
                             p.push_slice(data);
@@ -144,7 +148,7 @@ impl Connector for SourceConnector {
                 }
             },
             move |e| {
-                eprintln!("[source] stream error: {e}");
+                log(format!("[source] stream error: {e}"));
                 f2.store(true, Ordering::Relaxed);
             },
             None,

@@ -14,13 +14,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Shared gain as f32 bits. Starts at 1.0 and stays there if the OS value can't be read.
-pub fn start(stop: Arc<AtomicBool>) -> Arc<AtomicU32> {
+pub fn start(stop: Arc<AtomicBool>, follow: Arc<AtomicBool>) -> Arc<AtomicU32> {
     let gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
     let g = gain.clone();
     std::thread::spawn(move || {
         let mut reader = platform::Reader::new(); // created here: COM objects are thread-bound
         while !stop.load(Ordering::Relaxed) {
-            if let Some(v) = reader.read() {
+            if !follow.load(Ordering::Relaxed) {
+                g.store(1.0f32.to_bits(), Ordering::Relaxed); // not following: full level
+            } else if let Some(v) = reader.read() {
                 g.store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
             }
             std::thread::sleep(Duration::from_millis(250));

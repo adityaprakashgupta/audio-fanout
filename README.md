@@ -24,6 +24,9 @@ as you like, on any OS, with per-device delay and volume.
 
 ## Features
 
+- **Interactive terminal UI** (ratatui): add and remove outputs from a live
+  dropdown while audio is playing, and change each output's **volume and latency
+  on demand**. The device list updates as hardware is plugged in or removed.
 - **Any number of outputs**, each on its own audio thread. One failing device
   does not stop the others.
 - **Drift correction.** Every device has its own hardware clock, so naive copying
@@ -97,7 +100,7 @@ and cpal can capture uniformly. You make one by installing a virtual audio devic
 then setting it as your system's default **output**.
 
 | OS | Install | Source (`--source`) | Set as default output |
-| --- | --- | --- | --- |
+|---|---|---|---|
 | Windows | [VB-Cable](https://vb-audio.com/Cable/) | `CABLE Output` | `CABLE Input` |
 | macOS | [BlackHole](https://github.com/ExistentialAudio/BlackHole) | `BlackHole 2ch` | `BlackHole 2ch` |
 | Linux | a PulseAudio/PipeWire null sink (below) | its monitor source | the null sink |
@@ -134,36 +137,91 @@ cargo build --release
 
 ## Usage
 
+### Terminal UI (default)
+
 ```sh
-audio-fanout --list
-audio-fanout --source "<source>" --out "<name>[:delay_ms[:volume_percent]]" [--out ...]
+audio-fanout                             # pick the source on screen
+audio-fanout --source "CABLE Output"     # skip the source screen
+audio-fanout --source "CABLE Output" --out "Speakers:180" --out "Earbuds:0:50"   # preload outputs
 ```
 
-Names are case-insensitive substrings of what `--list` prints.
+```
+┌ audio-fanout ──────────────────────────────────────────────────────────────┐
+│ Source: CABLE Output (VB-Audio Virtual Cable) (48000 Hz, 2 ch) ●           │
+│     system volume: following (x72%)                                        │
+├ Outputs ───────────────────────────────────────────────────────────────────┤
+│ Status    Output                       Volume          Delay     Buffer    │
+│ ● live    Speakers (Realtek(R) Audio)  ████████░░  80% +180 ms  38/200 ms  │
+│ ● live    Headphones (OnePlus Bullets) █████░░░░░  50%   +0 ms   35/40 ms   │
+│ ◌ waiting Headphones (Airdopes Alpha)  █████░░░░░  50%  +20 ms   -          │
+├ Log ───────────────────────────────────────────────────────────────────────┤
+│ [00:00:03] [Speakers (Realtek(R) Audio)] connected: ... (48000 Hz, 2 ch)   │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+| Key | Action |
+|---|---|
+| `↑` `↓` (or `k` `j`) | Select an output |
+| `←` `→` (or `h` `l`) | Volume down / up by 5% |
+| `-` `+` | Volume down / up by 1% |
+| `[` `]` | Delay down / up by 10 ms |
+| `{` `}` | Delay down / up by 50 ms |
+| `m` | Mute / unmute the selected output |
+| `a` | Add an output: opens a dropdown of the devices present right now |
+| `d` or `Del` | Remove the selected output |
+| `f` | Follow / stop following the system volume |
+| `q` or `Ctrl-C` | Quit |
+
+**Adding and removing outputs live.** Press `a` for a dropdown of output devices.
+The list refreshes every second, so a device you plug in or switch on appears
+while the dropdown is open, and one that disappears vanishes from it. The
+highlight stays on the device you chose even when the list changes around it.
+Devices already in the group are hidden, and so is any device that would feed
+back into the source (such as `CABLE Input` when the source is `CABLE Output`).
+Nothing restarts when you add or remove an output; the others keep playing.
+
+**Changing volume and delay live.** Changes apply immediately while you listen.
+Volume and mute ramp smoothly. Increasing a delay causes a short silence on that
+output equal to the change (it has to buffer more audio), and decreasing it skips
+the surplus audio with a quick fade-in. The delay maximum is 1500 ms.
+Outputs added from the UI start at 50% volume, so new earbuds don't start at full
+blast.
+
+If you give no `--source`, the first screen lists input devices (and, on Windows,
+output devices that can be captured by loopback) so you can pick one.
+
+### Headless / scripting
+
+```sh
+audio-fanout --no-tui --source "<source>" --out "<name>[:delay_ms[:volume_percent]]" [--out ...]
+```
+
+Logs go to stdout and Enter quits. This uses the same engine as the TUI.
 
 | Option | Meaning |
-| --- | --- |
+|---|---|
 | `--list` | Print input devices (sources) and output devices |
 | `--source NAME` | The device audio is copied from |
 | `--out NAME[:DELAY[:VOL]]` | An output. `DELAY` in milliseconds, `VOL` in percent. Repeat for each output |
-| `--no-follow-volume` | Ignore the system volume and play at full level |
-| `FANOUT_DEBUG=1` (env) | Every 5 s, print each output's buffer fill and resample ratio |
+| `--no-follow-volume` | Start without following the system volume |
+| `--no-tui` | Run without the terminal UI |
+
+Names are case-insensitive substrings of what `--list` prints.
 
 Example (Windows):
 
 ```sh
-audio-fanout --source "CABLE Output" \
+audio-fanout --no-tui --source "CABLE Output" \
   --out "Realtek:180" \
   --out "Headphones:0:50" \
   --out "Earbuds:20:50"
 ```
 
-Press Enter to quit.
-
 ### Aligning the delays
 
 A delay can only add latency, so the slowest device gets `:0` and every other
-device is delayed to match it.
+device is delayed to match it. In the TUI you can adjust the delays with `[` `]`
+while listening, which is the easiest way to line them up.
 
 1. Play something with sharp clicks (a metronome video works well) with all
    outputs at `:0`.
@@ -183,7 +241,7 @@ times a second and scales every output by it, on top of each output's own
 `:volume`.
 
 | OS | How it is read |
-| --- | --- |
+|---|---|
 | Windows | Endpoint volume API (exact dB attenuation) |
 | Linux | `pactl` (percent, cubic curve as PulseAudio uses) |
 | macOS | `osascript` (approximate curve) |
@@ -210,7 +268,13 @@ Caveats:
 - Downmix and upmix are simple (average to mono, duplicate to stereo, extra
   channels silent), not full surround handling.
 - Never choose the virtual device's own playback side as an output, or you create
-  a feedback loop. Only loopback sources are checked automatically.
+  a feedback loop. The TUI hides the obvious cases (the two halves of a virtual
+  cable, or a device that is both input and output), but the check goes by name,
+  so it cannot catch every setup.
+- The source cannot be changed while running; restart to use another one.
+- Settings (outputs, delays, volumes) are not saved between runs yet.
+- On Linux, ALSA sometimes prints diagnostics straight to the terminal, which can
+  garble the TUI. Run it as `audio-fanout 2>/dev/null` if you see that.
 - You may not be allowed to redistribute VB-Cable or BlackHole with your own
   software. Check their licenses before you ship an installer.
 
@@ -220,7 +284,10 @@ The drift controller, delay, rate and channel conversion, volume ramping and the
 reconnect state machine (device absent at startup, unplugged, plugged back in,
 prompt shutdown) are covered by unit tests (`cargo test`) that run without any
 audio hardware, and the volume parsers are tested for Linux and macOS output
-formats. Reconnection against real devices has not been exercised yet. The code type-checks
+formats. The TUI's key handling and drawing are tested without a terminal (a fake engine
+and ratatui's test backend), including the live dropdown following a device by
+name as the list changes. Live delay and volume changes are covered by audio
+tests. Reconnection and the TUI have not yet been exercised against real devices. The code type-checks
 for Windows (MSVC).
 
 Windows is the primary development platform. macOS and Linux paths are written
@@ -237,7 +304,7 @@ cargo test --release
 - Use OS hot-plug notifications for instant detection instead of polling
 - Let the source change format on reconnect
 - Save outputs, delays and volumes in a config file
-- Tray or small GUI for volume and delay
+- Remember outputs, delays and volumes between runs
 - Terminal master-volume keys for platforms without a system volume to follow
 - Move to cpal 0.18 (the API changed from the 0.15 used here)
 - A custom macOS virtual device with volume control, if existing ones fall short
