@@ -40,8 +40,12 @@ impl Connector for OutputConnector {
 
     fn connect(&mut self) -> Result<OutConn> {
         let host = cpal::default_host();
-        let dev = find(host.output_devices()?, &self.needle)
-            .ok_or_else(|| anyhow!("no output device matching \"{}\"", self.needle))?;
+        let dev = if self.needle.is_empty() {
+            host.default_output_device().ok_or_else(|| anyhow!("no default output device"))?
+        } else {
+            find(host.output_devices()?, &self.needle)
+                .ok_or_else(|| anyhow!("no output device matching \"{}\"", self.needle))?
+        };
         let name = name_of(&dev);
         if loops_back_to(&self.source_name, &name) {
             bail!("\"{name}\" would feed back into the source");

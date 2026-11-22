@@ -2,6 +2,8 @@
 //! show devices appearing and disappearing without ever blocking on enumeration.
 
 use crate::devices::name_of;
+use crate::discovery::{Discovery, Receiver};
+use crate::proto::DISCOVERY_PORT;
 use cpal::traits::HostTrait;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,6 +14,8 @@ use std::time::Duration;
 pub struct Snapshot {
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
+    /// Network receivers announcing themselves on the LAN right now.
+    pub receivers: Vec<Receiver>,
 }
 
 fn names(it: Result<impl Iterator<Item = cpal::Device>, impl std::fmt::Debug>) -> Vec<String> {
@@ -26,11 +30,12 @@ fn names(it: Result<impl Iterator<Item = cpal::Device>, impl std::fmt::Debug>) -
 
 pub fn enumerate() -> Snapshot {
     let host = cpal::default_host();
-    Snapshot { inputs: names(host.input_devices()), outputs: names(host.output_devices()) }
+    Snapshot { inputs: names(host.input_devices()), outputs: names(host.output_devices()), receivers: Vec::new() }
 }
 
 pub struct Watcher {
     snap: Arc<Mutex<Snapshot>>,
+    discovery: Discovery,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
@@ -57,11 +62,13 @@ impl Watcher {
                 }
             })
             .expect("spawn watcher");
-        Watcher { snap, stop, join: Some(join) }
+        Watcher { snap, discovery: Discovery::start(DISCOVERY_PORT), stop, join: Some(join) }
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        self.snap.lock().map(|g| g.clone()).unwrap_or_default()
+        let mut s = self.snap.lock().map(|g| g.clone()).unwrap_or_default();
+        s.receivers = self.discovery.receivers();
+        s
     }
 }
 

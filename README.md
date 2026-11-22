@@ -27,6 +27,10 @@ as you like, on any OS, with per-device delay and volume.
 - **Interactive terminal UI** (ratatui): add and remove outputs from a live
   dropdown while audio is playing, and change each output's **volume and latency
   on demand**. The device list updates as hardware is plugged in or removed.
+- **Network streaming.** Send the audio to other laptops running `audio-fanout
+  --receive`. A receiver shows up as just another output: the same volume, delay,
+  mute, live add/remove and automatic reconnection, with raw PCM over UDP and no
+  codec latency. See [Network streaming](#network-streaming).
 - **Any number of outputs**, each on its own audio thread. One failing device
   does not stop the others.
 - **Drift correction.** Every device has its own hardware clock, so naive copying
@@ -92,6 +96,98 @@ find device ─▶ configure ─▶ start stream ─▶ watch ──(error / dev
 
 If a Bluetooth device renegotiates its codec on reconnect, its latency can change.
 The resync is correct, but you may need to re-tune that device's `:delay`.
+
+## Network streaming
+
+One laptop is the **broadcaster**: it captures the audio and runs the TUI. Other
+laptops are **receivers**: each plays the stream on its own speakers. In the
+broadcaster's table a receiver is simply another output row.
+
+```
+ broadcaster                                          receiver (another laptop)
+ apps -> virtual device -> audio-fanout  --UDP-->  audio-fanout --receive -> speakers
+                          \-> local outputs
+```
+
+### Quick start
+
+On each receiving laptop:
+
+```sh
+audio-fanout --receive                 # plays on the default output device
+audio-fanout --receive --device "Headphones" --name "Kitchen"
+```
+
+On the broadcaster, either press `a`: receivers on the same network announce
+themselves once a second and appear in the dropdown (and disappear when they
+stop), or add one by address with `n` (type `192.168.1.5` or `192.168.1.5:47800`),
+or start with it:
+
+```sh
+audio-fanout --source "CABLE Output" --send 192.168.1.5 --send "kitchen.local,120,50"
+```
+
+`--send HOST[:PORT][,DELAY_MS[,VOLUME_PCT]]`. Receivers listen on UDP **47800**
+and announce themselves to UDP **47801**. On Windows, allow `audio-fanout` through
+the firewall on private networks when prompted (the receiver must accept incoming UDP).
+
+### Controls work as for any output
+
+Volume, mute and delay are set in the broadcaster's TUI and sent to the receiver the
+moment they change (and repeated four times a second, so a lost packet is harmless).
+The receiver applies them with the same pipeline as a local device, including the
+smooth volume ramps and the live delay behavior. The receiver's own system volume
+is applied on top (`--no-follow-volume` to disable). A receiver the broadcaster
+cannot reach is shown as waiting or lost and is retried automatically; when it
+returns, only that output resyncs.
+
+The receiver row also shows the **link**: round-trip time, packet loss, and the
+receiver's own buffer fill. `◐ no output` means the link is fine but the receiver has
+no working output device.
+
+### How it stays low-latency
+
+- **UDP, not TCP.** A lost packet becomes a few milliseconds of silence instead of
+  stalling the stream behind a retransmission.
+- **No codec.** Audio goes out as raw 32-bit float PCM (about 3.1 Mbit/s per receiver for
+  48 kHz stereo), so there is no compression delay.
+- **Small packets** of about 3 ms of audio, under the size where IP would fragment them.
+- **Loss concealment that keeps time.** A lost packet is replaced by silence of the
+  same length, so everything after it stays on its slot and the delay does not drift.
+- **Drift correction on the receiver.** Its device clock differs from the
+  broadcaster's, so the receiver runs the same buffer-level controller and resampler
+  as a local output.
+- **Jitter cushion.** The receiver buffers `--jitter-ms` (default 30 ms) to absorb
+  network jitter, plus whatever delay you set. Lower it on wired networks, raise it
+  on busy Wi-Fi.
+
+Rough expectation from the design (not a measurement): capture period (~10 ms) +
+network (a few ms) + jitter cushion (30 ms by default) + the receiver's device
+buffer (~10 ms) gives roughly 50 ms end to end; with `--jitter-ms 15` on wired
+Ethernet, nearer 35 ms. As with Bluetooth, use the delay controls to line the
+receivers up with each other and with local speakers by ear.
+
+### Protocol
+
+All UDP, little-endian, 12-byte header (`"AF"`, version, type, session, sequence).
+Types: `HELLO`/`ACK` (handshake, retransmitted until acknowledged), `AUDIO`,
+`STATE` (delay, volume, mute and a timestamp, which doubles as a ping), `PONG`
+(echoed timestamp plus receiver statistics), `BYE`, and `ANNOUNCE` (discovery). The
+full layout is documented at the top of `src/proto.rs`. A receiver serves one
+broadcaster at a time: a restarted broadcaster on the same machine takes over, a
+second machine is told the receiver is busy, and a broadcaster that goes silent for
+1.5 s is dropped.
+
+### Network limits
+
+- **No encryption or authentication.** Anyone on the same network can send audio to a
+  receiver that is idle. Use it on networks you trust.
+- Wi-Fi works but is the weak link: prefer 5 GHz, avoid congested channels, and turn
+  off Wi-Fi power saving. Networks with "client isolation" block receivers from
+  being reached, and broadcast-blocking networks hide them from discovery (use `n`
+  or `--send` with the address).
+- IPv4 only. One broadcaster per receiver, and one output device per receiver.
+- Receivers are not synchronized to a shared clock: alignment between them is by ear.
 
 ## Setup
 
@@ -167,7 +263,8 @@ audio-fanout --source "CABLE Output" --out "Speakers:180" --out "Earbuds:0:50"  
 | `[` `]` | Delay down / up by 10 ms |
 | `{` `}` | Delay down / up by 50 ms |
 | `m` | Mute / unmute the selected output |
-| `a` | Add an output: opens a dropdown of the devices present right now |
+| `a` | Add an output: opens a dropdown of the devices and network receivers present right now |
+| `n` | Add a network receiver by typing its address |
 | `d` or `Del` | Remove the selected output |
 | `f` | Follow / stop following the system volume |
 | `q` or `Ctrl-C` | Quit |
@@ -205,6 +302,8 @@ Logs go to stdout and Enter quits. This uses the same engine as the TUI.
 | `--out NAME[:DELAY[:VOL]]` | An output. `DELAY` in milliseconds, `VOL` in percent. Repeat for each output |
 | `--no-follow-volume` | Start without following the system volume |
 | `--no-tui` | Run without the terminal UI |
+| `--send HOST[:PORT][,DELAY[,VOL]]` | Stream to a network receiver. Repeat for each one |
+| `--receive` | Run as a network receiver (with `--port`, `--device`, `--jitter-ms`, `--name`) |
 
 Names are case-insensitive substrings of what `--list` prints.
 
@@ -287,7 +386,11 @@ audio hardware, and the volume parsers are tested for Linux and macOS output
 formats. The TUI's key handling and drawing are tested without a terminal (a fake engine
 and ratatui's test backend), including the live dropdown following a device by
 name as the list changes. Live delay and volume changes are covered by audio
-tests. Reconnection and the TUI have not yet been exercised against real devices. The code type-checks
+tests. Network streaming is tested end to end over real UDP sockets on loopback (handshake,
+audio, every control, statistics, disconnect and reconnect, a silent or dead peer, a
+second broadcaster, foreign and malformed packets), and the protocol decoder is
+fuzzed to never panic. It has not yet been tried between two machines or over Wi-Fi.
+Reconnection and the TUI have not yet been exercised against real devices. The code type-checks
 for Windows (MSVC).
 
 Windows is the primary development platform. macOS and Linux paths are written
@@ -305,6 +408,9 @@ cargo test --release
 - Let the source change format on reconnect
 - Save outputs, delays and volumes in a config file
 - Remember outputs, delays and volumes between runs
+- Network: pairing or encryption, a shared clock for automatic alignment, an optional
+  codec for slow links, multicast for many receivers, and a TCP fallback for networks
+  that block UDP
 - Terminal master-volume keys for platforms without a system volume to follow
 - Move to cpal 0.18 (the API changed from the 0.15 used here)
 - A custom macOS virtual device with volume control, if existing ones fall short
