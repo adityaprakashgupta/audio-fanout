@@ -28,10 +28,23 @@ pub const NEW_OUTPUT_VOLUME_PCT: u32 = 50;
 
 // ---- what the UI needs to know about the engine --------------------------------
 
+/// What the receiver reports about a network output.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NetView {
+    pub rtt_ms: f32,
+    pub loss_pct: f32,
+    /// The receiver has a working output device.
+    pub playing: bool,
+}
+
 #[derive(Clone)]
 pub struct OutputView {
     pub id: u64,
+    /// Key: a device name, or `net:IP:PORT` for a network receiver.
     pub name: String,
+    /// What the table shows (filled in from the live device list).
+    pub label: String,
+    pub net: Option<NetView>,
     pub connected: bool,
     pub volume_pct: u32,
     pub muted: bool,
@@ -66,18 +79,39 @@ impl EngineLike for Engine {
         let rate = self.src_rate.max(1);
         self.handles()
             .iter()
-            .map(|o| OutputView {
-                id: o.id,
-                name: o.name.clone(),
-                connected: o.stats.connected.load(Ordering::Relaxed),
-                volume_pct: o.settings.volume_pct.load(Ordering::Relaxed),
-                muted: o.settings.muted.load(Ordering::Relaxed),
-                delay_ms: o.settings.delay_ms.load(Ordering::Relaxed),
-                fill_ms: o.stats.fill_frames.load(Ordering::Relaxed) * 1000 / rate,
-                target_ms: o.stats.target_frames.load(Ordering::Relaxed) * 1000 / rate,
-                ratio_ppm: o.stats.ratio_ppm.load(Ordering::Relaxed),
-                reconnects: o.stats.reconnects.load(Ordering::Relaxed),
-                settings: o.settings.clone(),
+            .map(|o| {
+                // A network output's buffer lives on the receiver: show what it reports.
+                let (fill_ms, target_ms, net) = match &o.net {
+                    Some(n) => (
+                        n.remote_fill_ms.load(Ordering::Relaxed),
+                        n.remote_target_ms.load(Ordering::Relaxed),
+                        Some(NetView {
+                            rtt_ms: n.rtt_us.load(Ordering::Relaxed) as f32 / 1000.0,
+                            loss_pct: n.loss_pct(),
+                            playing: n.playing.load(Ordering::Relaxed),
+                        }),
+                    ),
+                    None => (
+                        o.stats.fill_frames.load(Ordering::Relaxed) * 1000 / rate,
+                        o.stats.target_frames.load(Ordering::Relaxed) * 1000 / rate,
+                        None,
+                    ),
+                };
+                OutputView {
+                    id: o.id,
+                    name: o.name.clone(),
+                    label: o.name.clone(),
+                    net,
+                    connected: o.stats.connected.load(Ordering::Relaxed),
+                    volume_pct: o.settings.volume_pct.load(Ordering::Relaxed),
+                    muted: o.settings.muted.load(Ordering::Relaxed),
+                    delay_ms: o.settings.delay_ms.load(Ordering::Relaxed),
+                    fill_ms,
+                    target_ms,
+                    ratio_ppm: o.stats.ratio_ppm.load(Ordering::Relaxed),
+                    reconnects: o.stats.reconnects.load(Ordering::Relaxed),
+                    settings: o.settings.clone(),
+                }
             })
             .collect()
     }
@@ -147,11 +181,31 @@ impl Picker {
 /// Output devices that can still be added: present now, not already in the group,
 /// and not a device that would feed back into the source.
 pub fn available_outputs(snap: &Snapshot, source: &str, existing: &[OutputView]) -> Vec<String> {
-    snap.outputs
+    let mut v: Vec<String> = snap
+        .outputs
         .iter()
         .filter(|d| !existing.iter().any(|o| name_matches(&o.name, d)) && !loops_back_to(source, d))
         .cloned()
-        .collect()
+        .collect();
+    // network receivers announcing themselves on the LAN, by key `net:IP:PORT`
+    for r in &snap.receivers {
+        let key = format!("net:{}", r.addr);
+        if !existing.iter().any(|o| o.name == key) {
+            v.push(key);
+        }
+    }
+    v
+}
+
+/// Human-readable text for a device key (device names are their own label).
+pub fn item_label(key: &str, snap: &Snapshot) -> String {
+    match key.strip_prefix("net:") {
+        Some(addr) => match snap.receivers.iter().find(|r| r.addr.to_string() == addr) {
+            Some(r) => format!("[net] {} ({}){}", r.name, r.addr.ip(), if r.busy { " - busy" } else { "" }),
+            None => format!("[net] {addr}"),
+        },
+        None => key.to_string(),
+    }
 }
 
 /// Devices that can be the source: inputs, plus (Windows) outputs via loopback.
@@ -173,6 +227,8 @@ pub fn source_candidates(snap: &Snapshot) -> Vec<(String, String)> {
 pub enum Mode {
     Normal,
     Add(Picker),
+    /// Typing the address of a network receiver (`host[:port]`).
+    Input(String),
 }
 
 pub struct App {
@@ -223,6 +279,27 @@ impl App {
                     self.mode = Mode::Add(picker);
                 }
             }
+            Mode::Input(mut text) => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => {
+                    let t = text.trim().to_string();
+                    if !t.is_empty() {
+                        match eng.add_output(&format!("net:{t}")) {
+                            Ok(()) => self.selected = outs.len(),
+                            Err(e) => log(format!("could not add {t}: {e}")),
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    text.pop();
+                    self.mode = Mode::Input(text);
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && text.len() < 64 => {
+                    text.push(c);
+                    self.mode = Mode::Input(text);
+                }
+                _ => self.mode = Mode::Input(text),
+            },
             Mode::Normal => self.normal_key(key.code, eng, &outs),
         }
     }
@@ -264,6 +341,7 @@ impl App {
             }
             KeyCode::Char('f') => eng.set_follow_volume(!eng.follow_volume()),
             KeyCode::Char('a') => self.mode = Mode::Add(Picker::default()),
+            KeyCode::Char('n') => self.mode = Mode::Input(String::new()),
             KeyCode::Char('d') | KeyCode::Delete => {
                 if let Some(o) = sel {
                     eng.remove_output(o.id);
@@ -284,13 +362,18 @@ pub struct ViewModel {
     pub follow: bool,
     pub logs: Vec<String>,
     pub add_items: Vec<String>,
+    pub add_labels: Vec<String>,
 }
 
 impl ViewModel {
     pub fn build<E: EngineLike>(eng: &E, snap: &Snapshot) -> ViewModel {
-        let outputs = eng.outputs();
+        let mut outputs = eng.outputs();
+        for o in &mut outputs {
+            o.label = item_label(&o.name, snap);
+        }
         let source = eng.source();
         let add_items = available_outputs(snap, &source.name, &outputs);
+        let add_labels = add_items.iter().map(|k| item_label(k, snap)).collect();
         ViewModel {
             source,
             outputs,
@@ -298,6 +381,7 @@ impl ViewModel {
             follow: eng.follow_volume(),
             logs: log::recent(6),
             add_items,
+            add_labels,
         }
     }
 }
@@ -352,7 +436,11 @@ pub fn draw(f: &mut Frame, app: &App, vm: &ViewModel) {
             .iter()
             .map(|o| {
                 let (status, color) = if o.connected {
-                    ("● live", Color::Green)
+                    if o.net.as_ref().map_or(true, |n| n.playing) {
+                        ("● live", Color::Green)
+                    } else {
+                        ("◐ no output", Color::Yellow) // linked, but the receiver has no working device
+                    }
                 } else if o.reconnects > 0 {
                     ("○ lost", Color::Red)
                 } else {
@@ -364,13 +452,17 @@ pub fn draw(f: &mut Frame, app: &App, vm: &ViewModel) {
                     format!("{} {:>3}%", bar(o.volume_pct, 10), o.volume_pct)
                 };
                 let (buf, drift) = if o.connected {
-                    (format!("{}/{} ms", o.fill_ms, o.target_ms), format!("{:+} ppm", o.ratio_ppm))
+                    let link = match &o.net {
+                        Some(n) => format!("rtt {:.1} ms, {:.1}% loss", n.rtt_ms, n.loss_pct),
+                        None => format!("{:+} ppm", o.ratio_ppm),
+                    };
+                    (format!("{}/{} ms", o.fill_ms, o.target_ms), link)
                 } else {
                     ("-".into(), "-".into())
                 };
                 Row::new(vec![
                     Cell::from(status).style(Style::new().fg(color)),
-                    Cell::from(o.name.clone()),
+                    Cell::from(o.label.clone()),
                     Cell::from(vol),
                     Cell::from(format!("+{} ms", o.delay_ms)),
                     Cell::from(buf),
@@ -380,17 +472,17 @@ pub fn draw(f: &mut Frame, app: &App, vm: &ViewModel) {
             })
             .collect();
         let widths = [
-            Constraint::Length(10),
+            Constraint::Length(12), // "◐ no output"
             Constraint::Min(18),
             Constraint::Length(16),
             Constraint::Length(9),
-            Constraint::Length(12),
             Constraint::Length(11),
-            Constraint::Length(5),
+            Constraint::Length(22), // "rtt 2.3 ms, 0.5% loss"
+            Constraint::Length(4),
         ];
         let t = Table::new(rows, widths)
             .header(
-                Row::new(["Status", "Output", "Volume", "Delay", "Buffer", "Drift", "Lost"])
+                Row::new(["Status", "Output", "Volume", "Delay", "Buffer", "Drift / link", "Lost"])
                     .style(Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
             )
             .block(block)
@@ -403,16 +495,33 @@ pub fn draw(f: &mut Frame, app: &App, vm: &ViewModel) {
     let lines: Vec<Line> = vm.logs.iter().map(|l| Line::from(l.as_str())).collect();
     f.render_widget(Paragraph::new(lines).block(Block::bordered().title(" Log ")), logs);
     let help_text = "↑↓ select   ←→ volume ±5   - + volume ±1   [ ] delay ±10 ms   { } delay ±50 ms\n\
-                     m mute   a add output   d remove   f follow system volume   q quit";
+                     m mute   a add output   n add network receiver   d remove   f follow system volume   q quit";
     f.render_widget(
         Paragraph::new(help_text).wrap(Wrap { trim: true }).block(Block::bordered().title(" Keys ")),
         help,
     );
 
     // dropdown
-    if let Mode::Add(p) = &app.mode {
-        let labels = vm.add_items.clone();
-        draw_picker(f, area, " Add output: ↑↓ choose · Enter add · Esc cancel (list is live) ", &vm.add_items, &labels, p);
+    match &app.mode {
+        Mode::Add(p) => draw_picker(
+            f,
+            area,
+            " Add output: ↑↓ choose · Enter add · Esc cancel (list is live) ",
+            &vm.add_items,
+            &vm.add_labels,
+            p,
+        ),
+        Mode::Input(text) => {
+            let rect = centered(area, area.width.saturating_sub(6).min(70), 5);
+            f.render_widget(Clear, rect);
+            let body = Paragraph::new(format!("\n  {text}_")).block(
+                Block::bordered()
+                    .title(" Add network receiver: host[:port] · Enter add · Esc cancel ")
+                    .border_style(Style::new().fg(Color::Cyan)),
+            );
+            f.render_widget(body, rect);
+        }
+        Mode::Normal => {}
     }
 }
 
@@ -511,6 +620,8 @@ mod tests {
         OutputView {
             id,
             name: name.into(),
+            label: name.into(),
+            net: None,
             connected: true,
             volume_pct: 80,
             muted: false,
@@ -578,7 +689,11 @@ mod tests {
     }
 
     fn snap(outputs: &[&str]) -> Snapshot {
-        Snapshot { inputs: vec!["CABLE Output (VB-Audio Virtual Cable)".into()], outputs: outputs.iter().map(|s| s.to_string()).collect() }
+        Snapshot {
+            inputs: vec!["CABLE Output (VB-Audio Virtual Cable)".into()],
+            outputs: outputs.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
     }
 
     fn screen(vm: &ViewModel, app: &App, w: u16, h: u16) -> String {
@@ -752,6 +867,96 @@ mod tests {
         for (w, h) in [(1, 1), (10, 3), (30, 8), (60, 12)] {
             let _ = screen(&vm, &app, w, h);
             let _ = screen(&vm, &App::default(), w, h);
+        }
+    }
+
+    fn receiver(name: &str, addr: &str, busy: bool) -> crate::discovery::Receiver {
+        crate::discovery::Receiver { name: name.into(), addr: addr.parse().unwrap(), busy }
+    }
+
+    #[test]
+    fn discovered_receivers_join_the_live_dropdown_and_leave_it() {
+        let mut eng = Fake::new(&["Speakers"]);
+        let mut s = snap(&["Speakers"]);
+        s.receivers = vec![receiver("Kitchen", "192.168.1.5:47800", false), receiver("Den", "192.168.1.9:47800", true)];
+        let items = available_outputs(&s, &eng.source().name, &eng.outputs());
+        assert_eq!(items, vec!["net:192.168.1.5:47800", "net:192.168.1.9:47800"]);
+        assert_eq!(item_label(&items[0], &s), "[net] Kitchen (192.168.1.5)");
+        assert_eq!(item_label(&items[1], &s), "[net] Den (192.168.1.9) - busy");
+
+        // choose Kitchen from the dropdown: it is added by its net: key
+        let mut app = App::default();
+        app.on_key(key(KeyCode::Char('a')), &mut eng, &s);
+        app.on_key(key(KeyCode::Enter), &mut eng, &s);
+        assert_eq!(eng.outs.last().unwrap().name, "net:192.168.1.5:47800");
+
+        // already added: hidden from the list. And a receiver that stopped announcing is gone.
+        let items = available_outputs(&s, &eng.source().name, &eng.outputs());
+        assert_eq!(items, vec!["net:192.168.1.9:47800"]);
+        s.receivers.clear();
+        assert!(available_outputs(&s, &eng.source().name, &eng.outputs()).is_empty());
+        // a label for a receiver we no longer hear still renders
+        assert_eq!(item_label("net:10.0.0.2:47800", &s), "[net] 10.0.0.2:47800");
+    }
+
+    #[test]
+    fn n_prompts_for_an_address_and_adds_a_network_output() {
+        let mut eng = Fake::new(&[]);
+        let mut app = App::default();
+        let s = snap(&[]);
+        app.on_key(key(KeyCode::Char('n')), &mut eng, &s);
+        assert!(matches!(app.mode, Mode::Input(_)));
+        for c in "192.168.1.50x".chars() {
+            app.on_key(key(KeyCode::Char(c)), &mut eng, &s);
+        }
+        app.on_key(key(KeyCode::Backspace), &mut eng, &s); // fix the typo
+        // hotkeys are text while typing: 'q' must not quit, 'd' must not delete
+        app.on_key(key(KeyCode::Char('q')), &mut eng, &s);
+        app.on_key(key(KeyCode::Backspace), &mut eng, &s);
+        assert!(!app.quit);
+        app.on_key(key(KeyCode::Enter), &mut eng, &s);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(eng.outs.len(), 1);
+        assert_eq!(eng.outs[0].name, "net:192.168.1.50");
+
+        // Esc cancels; empty input adds nothing
+        app.on_key(key(KeyCode::Char('n')), &mut eng, &s);
+        app.on_key(key(KeyCode::Char('1')), &mut eng, &s);
+        app.on_key(key(KeyCode::Esc), &mut eng, &s);
+        app.on_key(key(KeyCode::Char('n')), &mut eng, &s);
+        app.on_key(key(KeyCode::Enter), &mut eng, &s);
+        assert_eq!(eng.outs.len(), 1);
+        // a failing add leaves the UI usable
+        eng.fail_add = true;
+        app.on_key(key(KeyCode::Char('n')), &mut eng, &s);
+        app.on_key(key(KeyCode::Char('x')), &mut eng, &s);
+        app.on_key(key(KeyCode::Enter), &mut eng, &s);
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn draws_network_rows_with_link_quality() {
+        let mut eng = Fake::new(&["Speakers", "net:192.168.1.5:47800", "net:192.168.1.9:47800"]);
+        eng.outs[1].net = Some(NetView { rtt_ms: 2.3, loss_pct: 0.5, playing: true });
+        eng.outs[2].net = Some(NetView { rtt_ms: 4.0, loss_pct: 0.0, playing: false });
+        let mut s = snap(&[]);
+        s.receivers = vec![receiver("Kitchen", "192.168.1.5:47800", false)];
+        let vm = ViewModel::build(&eng, &s);
+        let text = screen(&vm, &App::default(), 130, 30);
+        for needle in ["[net] Kitchen (192.168.1.5)", "rtt 2.3 ms, 0.5% loss", "no output", "[net] 192.168.1.9:47800", "Drift / link", "add network receiver"] {
+            assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn draws_the_address_prompt() {
+        let eng = Fake::new(&["Speakers"]);
+        let vm = ViewModel::build(&eng, &snap(&[]));
+        let app = App { selected: 0, mode: Mode::Input("192.168.1.5".into()), quit: false };
+        let text = screen(&vm, &app, 100, 28);
+        assert!(text.contains("Add network receiver") && text.contains("192.168.1.5_"), "{text}");
+        for (w, h) in [(1, 1), (12, 4), (40, 9)] {
+            let _ = screen(&vm, &app, w, h); // tiny terminals must not panic
         }
     }
 }

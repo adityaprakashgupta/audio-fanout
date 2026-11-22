@@ -28,6 +28,7 @@ pub struct Stats {
     pub target_frames: AtomicU32,
     pub connected: AtomicBool, // set by the supervisor
     pub reconnects: AtomicU32, // times an established connection was lost
+    pub underruns: AtomicU32,  // times playback ran dry after it had started
 }
 
 /// Per-output settings, changeable at any time from the UI thread.
@@ -44,6 +45,13 @@ impl Settings {
             volume_pct: AtomicU32::new(volume_pct.min(100)),
             muted: AtomicBool::new(false),
         }
+    }
+
+    /// Apply settings received from the broadcaster (network receivers).
+    pub fn apply_remote(&self, delay_ms: u32, volume_pct: u32, muted: bool) {
+        self.delay_ms.store(delay_ms.min(MAX_DELAY_MS), Ordering::Relaxed);
+        self.volume_pct.store(volume_pct.min(100), Ordering::Relaxed);
+        self.muted.store(muted, Ordering::Relaxed);
     }
 
     /// Returns the new value.
@@ -82,6 +90,7 @@ pub struct Slave {
     src_rate: usize,
     target: usize, // source frames to keep buffered (= delay + cushion)
     applied_delay: u32,
+    cushion_ms: u32,
     resampler: SincFixedIn<f32>,
     inter: Vec<f32>,
     inbuf: Vec<Vec<f32>>,
@@ -107,8 +116,12 @@ fn make_resampler(out_rate: u32, src_rate: u32, src_ch: usize) -> Result<SincFix
     Ok(SincFixedIn::<f32>::new(base, MAX_REL, params, CHUNK, src_ch)?)
 }
 
-fn target_frames(delay_ms: u32, src_rate: usize) -> usize {
-    delay_ms as usize * src_rate / 1000 + src_rate / 50 // delay + 20 ms cushion
+/// Default cushion: absorbs timing jitter of a local audio device. Network receivers
+/// use a larger one (see [`Slave::with_cushion_ms`]).
+pub const DEFAULT_CUSHION_MS: u32 = 20;
+
+fn target_frames(delay_ms: u32, src_rate: usize, cushion_ms: u32) -> usize {
+    (delay_ms + cushion_ms) as usize * src_rate / 1000 // delay + cushion
 }
 
 impl Slave {
@@ -126,7 +139,7 @@ impl Slave {
         let outbuf = vec![vec![0.0f32; resampler.output_frames_max()]; src_ch];
         let src_rate = src_rate as usize;
         let applied_delay = settings.delay_ms.load(Ordering::Relaxed);
-        let target = target_frames(applied_delay, src_rate);
+        let target = target_frames(applied_delay, src_rate, DEFAULT_CUSHION_MS);
         stats.target_frames.store(target as u32, Ordering::Relaxed);
         Ok(Slave {
             cons,
@@ -135,6 +148,7 @@ impl Slave {
             src_rate,
             target,
             applied_delay,
+            cushion_ms: DEFAULT_CUSHION_MS,
             resampler,
             inter: vec![0.0; CHUNK * src_ch],
             inbuf: vec![vec![0.0; CHUNK]; src_ch],
@@ -147,6 +161,15 @@ impl Slave {
             master,
             stats,
         })
+    }
+
+    /// Use a bigger (or smaller) jitter cushion than the 20 ms default. Network
+    /// receivers need more, to ride out Wi-Fi jitter and the sender's burst cadence.
+    pub fn with_cushion_ms(mut self, ms: u32) -> Self {
+        self.cushion_ms = ms;
+        self.target = target_frames(self.applied_delay, self.src_rate, ms);
+        self.stats.target_frames.store(self.target as u32, Ordering::Relaxed);
+        self
     }
 
     /// Throw away everything buffered and start over: stale audio is flushed, the
@@ -180,7 +203,7 @@ impl Slave {
     fn apply_delay(&mut self, delay_ms: u32) {
         let old = self.target;
         self.applied_delay = delay_ms;
-        self.target = target_frames(delay_ms, self.src_rate);
+        self.target = target_frames(delay_ms, self.src_rate, self.cushion_ms);
         self.stats.target_frames.store(self.target as u32, Ordering::Relaxed);
         self.err_avg = 0.0;
         if self.target > old {
@@ -276,6 +299,9 @@ impl Slave {
         drop(src);
         out[have..].fill(0.0);
         if have < want {
+            if self.primed {
+                self.stats.underruns.fetch_add(1, Ordering::Relaxed);
+            }
             self.primed = false; // underrun: rebuild the delay before playing again
         }
     }
@@ -572,5 +598,35 @@ mod tests {
         assert_eq!(s.adjust_delay(10), 10);
         assert_eq!(s.adjust_volume(10), 100);
         assert_eq!(s.adjust_volume(-500), 0);
+    }
+
+    /// Network receivers use a larger cushion: playback starts later, by exactly that much.
+    #[test]
+    fn bigger_cushion_delays_start_and_counts_underruns() {
+        let rb = HeapRb::<f32>::new(48_000 * 2 * 2);
+        let (mut prod, cons) = rb.split();
+        let stats = Arc::new(Stats::default());
+        let mut slave = Slave::new(cons, 2, 48_000, settings(0, 100), unity(), stats.clone())
+            .unwrap()
+            .with_cushion_ms(60);
+        assert_eq!(stats.target_frames.load(Ordering::Relaxed), 60 * 48);
+        let mut phase = 0.0f32;
+        let mut first = None;
+        for t in 0..20 {
+            prod.push_slice(&sine_chunk(480, 2, &mut phase, 0.1));
+            let mut out = vec![0.0f32; 480 * 2];
+            slave.fill(&mut out);
+            if first.is_none() && out.iter().any(|s| *s != 0.0) {
+                first = Some(t);
+            }
+        }
+        assert!(matches!(first, Some(t) if (5..=8).contains(&t)), "started at {first:?}");
+        assert_eq!(stats.underruns.load(Ordering::Relaxed), 0);
+        // starve it: the next fills run dry, which must be counted exactly once
+        for _ in 0..6 {
+            let mut out = vec![0.0f32; 480 * 2];
+            slave.fill(&mut out);
+        }
+        assert_eq!(stats.underruns.load(Ordering::Relaxed), 1);
     }
 }

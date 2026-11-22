@@ -4,6 +4,7 @@
 use crate::connectors::{OutputConnector, SourceConnector};
 use crate::devices::{f32_config, name_of, resolve_output_name, resolve_source};
 use crate::log::log;
+use crate::netout::{self, NetConnector, NetSender, NetStats};
 use crate::slave::{Settings, Slave, Stats};
 use crate::supervisor::{self, Timing};
 use crate::volume;
@@ -29,6 +30,8 @@ pub struct OutputHandle {
     pub name: String,
     pub settings: Arc<Settings>,
     pub stats: Arc<Stats>,
+    /// Present for network receivers: what the receiver reports back.
+    pub net: Option<Arc<NetStats>>,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
@@ -96,6 +99,9 @@ impl Engine {
     /// Add an output by device name (or part of one). The device does not have to be
     /// present yet: it is waited for and connected as soon as it appears.
     pub fn add_output(&mut self, needle: &str, delay_ms: u32, volume_pct: u32) -> Result<u64> {
+        if let Some(addr) = needle.strip_prefix("net:") {
+            return self.add_net_output(addr, delay_ms, volume_pct);
+        }
         let host = cpal::default_host();
         // Prefer the device's full name so later matching is exact.
         let name = resolve_output_name(&host, needle).unwrap_or_else(|| needle.to_string());
@@ -138,7 +144,57 @@ impl Engine {
             Timing::default(),
         );
         log(format!("added output: {name}"));
-        self.outputs.push(OutputHandle { id, name, settings, stats, stop, join: Some(join) });
+        self.outputs.push(OutputHandle { id, name, settings, stats, net: None, stop, join: Some(join) });
+        Ok(id)
+    }
+
+    /// Add a network receiver (`host[:port]`). Like a local device it may be absent for
+    /// now: the supervisor keeps trying, and reconnects if it drops later.
+    fn add_net_output(&mut self, hostport: &str, delay_ms: u32, volume_pct: u32) -> Result<u64> {
+        let addr = netout::parse_receiver_addr(hostport)?;
+        let key = format!("net:{addr}");
+        if self.outputs.iter().any(|o| o.name == key) {
+            bail!("{addr} is already in the group");
+        }
+        let rb = HeapRb::<f32>::new(self.src_rate as usize * self.src_ch * 2); // 2 s headroom
+        let (prod, cons) = rb.split();
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let settings = Arc::new(Settings::new(delay_ms, volume_pct));
+        let stats = Arc::new(Stats::default());
+        let net = Arc::new(NetStats::default());
+        let sender = Arc::new(Mutex::new(NetSender::new(cons, self.src_ch)));
+
+        let sink = Arc::new(Sink { id, prod: Mutex::new(prod) });
+        self.sinks.rcu(|cur| {
+            let mut v = Vec::clone(cur);
+            v.push(sink.clone());
+            v
+        });
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let join = supervisor::spawn(
+            key.clone(),
+            {
+                let (settings, net) = (settings.clone(), net.clone());
+                let (rate, channels) = (self.src_rate, self.src_ch as u16);
+                move || NetConnector {
+                    addr,
+                    sender,
+                    settings,
+                    stats: net,
+                    rate,
+                    channels,
+                    handshake_timeout: std::time::Duration::from_millis(1500),
+                }
+            },
+            stop.clone(),
+            stats.clone(),
+            Timing::default(),
+        );
+        log(format!("added network output: {addr}"));
+        self.outputs.push(OutputHandle { id, name: key, settings, stats, net: Some(net), stop, join: Some(join) });
         Ok(id)
     }
 
