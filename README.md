@@ -417,5 +417,4 @@ cargo test --release
 
 ## License
 
-Choose a license for the project (for example MIT or Apache-2.0) and add a
-`LICENSE` file.
+MIT
